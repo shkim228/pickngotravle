@@ -1,5 +1,6 @@
 import streamlit as st
-import streamlit.components.v1 as components
+from streamlit_folium import st_folium
+import folium
 from datetime import date, timedelta
 import datetime as dt
 import random
@@ -20,7 +21,6 @@ except ImportError:
 # ==============================================================================
 # 실제 서비스 시에는 st.secrets를 사용하는 것이 좋습니다.
 KAKAO_REST_KEY = "b8d55948ead19bbcc601ef925ca2e513"
-KAKAO_JS_KEY   = "386153cb9f0ff6dcd75180f93b083872"
 TOUR_API_KEY   = "f00743a5b81524c48f4b77f29b01f3e5cbca2806573aa1e86b8b0babe"
 GOOGLE_MAPS_KEY = "AIzaSyAs0N-PdsGa1ChGry_whs29u49pMzSTP-A"
 
@@ -103,7 +103,6 @@ st.markdown("""
 
 # [NEW] IATA Code Helper
 def get_iata_code(city_name: str) -> str:
-    # 간단한 매핑 (실제로는 더 많은 도시 필요)
     mapping = {
         "서울": "SEL", "인천": "ICN", "김포": "GMP",
         "제주": "CJU", "부산": "PUS",
@@ -119,7 +118,6 @@ def get_iata_code(city_name: str) -> str:
 class FlightService:
     def __init__(self):
         self.client = None
-        # 키가 설정되어 있고 기본값이 아닐 때만 초기화
         if AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET and "YOUR_" not in AMADEUS_CLIENT_ID:
             try:
                 self.client = Client(
@@ -145,7 +143,6 @@ class FlightService:
             if not response.data:
                 return None
 
-            # 첫 번째 결과만 파싱 (간소화)
             offer = response.data[0]
             itinerary = offer['itineraries'][0]
             segment = itinerary['segments'][0]
@@ -153,7 +150,7 @@ class FlightService:
             
             return {
                 "type": "항공",
-                "carrier": segment['carrierCode'], # 항공사 코드 (예: KE)
+                "carrier": segment['carrierCode'],
                 "flight_no": f"{segment['carrierCode']}{segment['number']}",
                 "price": float(price), 
                 "duration": int(itinerary['duration'][2:-1].replace('H', '60').replace('M', '')) if 'H' in itinerary['duration'] else 60,
@@ -168,15 +165,17 @@ class FlightService:
             print(f"Flight Search Error: {e}")
             return None
 
-# [NEW] Google Places Service (v1 New API)
+# [NEW] Google Places Service (Hybrid: New & Legacy)
 class GooglePlacesService:
     def __init__(self, api_key):
         self.api_key = api_key
-        self.base_url = "https://places.googleapis.com/v1/places:searchText"
+        self.v1_url = "https://places.googleapis.com/v1/places:searchText"
+        self.legacy_url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 
     def search_places(self, query: str) -> List[Dict]:
         if not self.api_key: return []
         
+        # 1. Try New API (v1)
         try:
             headers = {
                 "Content-Type": "application/json",
@@ -184,69 +183,130 @@ class GooglePlacesService:
                 "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.photos,places.location,places.id"
             }
             payload = {"textQuery": query, "languageCode": "ko"}
-            
-            res = requests.post(self.base_url, json=payload, headers=headers)
+            res = requests.post(self.v1_url, json=payload, headers=headers)
             
             if res.status_code == 200:
                 results = res.json().get('places', [])
-                places = []
-                for p in results[:3]: # Top 3
-                    # Photo URL Construction
-                    img_url = None
-                    if p.get('photos'):
-                        photo_name = p['photos'][0]['name'] # places/PLACE_ID/photos/PHOTO_ID
-                        # Skip photo API call to save quota/complexity, use placeholder or construct if simple
-                        # v1 photo API is complex (media/name), let's use Unsplash fallback for now or try to construct
-                        # img_url = f"https://places.googleapis.com/v1/{photo_name}/media?key={self.api_key}&maxHeightPx=400&maxWidthPx=400"
-                        # Note: v1 media endpoint returns binary, not URL. Better to use Unsplash for display speed.
-                        pass
-                    
-                    # Fallback Image
-                    if not img_url:
-                         img_url = f"https://source.unsplash.com/400x300/?{query.split()[-1]},{p['displayName']['text']}"
-
-                    lat = p.get('location', {}).get('latitude', 33.5)
-                    lng = p.get('location', {}).get('longitude', 126.5)
-
-                    places.append({
-                        "name": p['displayName']['text'],
-                        "category": "관광/맛집",
-                        "source": "Google",
-                        "url": f"https://www.google.com/maps/search/?api=1&query={lat},{lng}&query_place_id={p.get('id')}",
-                        "image": img_url,
-                        "lat": lat,
-                        "lng": lng,
-                        "rating": p.get('rating', 4.5)
-                    })
-                return places
-            else:
-                print(f"Google API Status: {res.status_code} {res.text}")
+                return self._parse_v1_results(results, query)
         except Exception as e:
-            print(f"Google Places Error: {e}")
+            print(f"Google v1 Error: {e}")
+
+        # 2. Try Legacy API (Fallback)
+        try:
+            params = {"query": query, "key": self.api_key, "language": "ko"}
+            res = requests.get(self.legacy_url, params=params)
+            if res.status_code == 200:
+                results = res.json().get('results', [])
+                return self._parse_legacy_results(results, query)
+        except Exception as e:
+            print(f"Google Legacy Error: {e}")
+            
         return []
+
+    def _parse_v1_results(self, results, query):
+        places = []
+        for p in results[:3]:
+            img_url = f"https://source.unsplash.com/400x300/?{query.split()[-1]},{p['displayName']['text']}"
+            lat = p.get('location', {}).get('latitude', 33.5)
+            lng = p.get('location', {}).get('longitude', 126.5)
+            places.append({
+                "name": p['displayName']['text'],
+                "category": "관광/맛집",
+                "source": "Google(v1)",
+                "url": f"https://www.google.com/maps/search/?api=1&query={lat},{lng}&query_place_id={p.get('id')}",
+                "image": img_url,
+                "lat": lat, "lng": lng,
+                "rating": p.get('rating', 4.5)
+            })
+        return places
+
+    def _parse_legacy_results(self, results, query):
+        places = []
+        for p in results[:3]:
+            img_url = f"https://source.unsplash.com/400x300/?{query.split()[-1]},{p['name']}"
+            places.append({
+                "name": p['name'],
+                "category": "관광/맛집",
+                "source": "Google(Legacy)",
+                "url": f"https://www.google.com/maps/place/?q=place_id:{p['place_id']}",
+                "image": img_url,
+                "lat": p['geometry']['location']['lat'],
+                "lng": p['geometry']['location']['lng'],
+                "rating": p.get('rating', 4.5)
+            })
+        return places
 
 class HybridDatabase:
     def __init__(self):
         self.flight_service = FlightService()
+        self.google_service = GooglePlacesService(GOOGLE_MAPS_KEY)
+        
+        # [NEW] Expanded Mock DB for Major Cities
+        self.mock_db = {
+            "바르셀로나": {
+                "lat": 41.3851, "lng": 2.1734,
+                "spots": [
+                    {"name": "사그라다 파밀리아", "category": "관광명소", "lat": 41.4036, "lng": 2.1744, "rating": 4.9},
+                    {"name": "구엘 공원", "category": "휴양/힐링", "lat": 41.4145, "lng": 2.1527, "rating": 4.7},
+                    {"name": "카사 바트요", "category": "관광명소", "lat": 41.3916, "lng": 2.1649, "rating": 4.8},
+                    {"name": "보케리아 시장", "category": "맛집탐방", "lat": 41.3817, "lng": 2.1715, "rating": 4.6},
+                    {"name": "바르셀로네타 해변", "category": "휴양/힐링", "lat": 41.3784, "lng": 2.1925, "rating": 4.5},
+                    {"name": "고딕 지구", "category": "관광명소", "lat": 41.3825, "lng": 2.1760, "rating": 4.7},
+                    {"name": "카사 밀라", "category": "관광명소", "lat": 41.3954, "lng": 2.1619, "rating": 4.6},
+                    {"name": "몬주익 언덕", "category": "자연풍경", "lat": 41.3635, "lng": 2.1658, "rating": 4.6},
+                    {"name": "피카소 미술관", "category": "관광명소", "lat": 41.3852, "lng": 2.1809, "rating": 4.5},
+                    {"name": "캄프 누 (FC바르셀로나)", "category": "액티비티", "lat": 41.3809, "lng": 2.1228, "rating": 4.8},
+                    {"name": "시우타데야 공원", "category": "휴양/힐링", "lat": 41.3884, "lng": 2.1874, "rating": 4.5},
+                    {"name": "El Glop (빠에야 맛집)", "category": "맛집탐방", "lat": 41.4010, "lng": 2.1560, "rating": 4.4},
+                    {"name": "Cervecería Catalana", "category": "맛집탐방", "lat": 41.3923, "lng": 2.1609, "rating": 4.6},
+                    {"name": "그라시아 거리 쇼핑", "category": "쇼핑", "lat": 41.3922, "lng": 2.1647, "rating": 4.5}
+                ],
+                "accommodations": [
+                    {"name": "W 바르셀로나", "type": "호텔", "stars": 5, "price_per_night": 55, "lat": 41.3684, "lng": 2.1901},
+                    {"name": "호텔 아츠 바르셀로나", "type": "호텔", "stars": 5, "price_per_night": 60, "lat": 41.3879, "lng": 2.1963},
+                    {"name": "H10 카사 밈사", "type": "호텔", "stars": 4, "price_per_night": 25, "lat": 41.3967, "lng": 2.1616},
+                    {"name": "호텔 1898", "type": "호텔", "stars": 4, "price_per_night": 30, "lat": 41.3833, "lng": 2.1706},
+                    {"name": "제너레이터 호스텔", "type": "게스트하우스", "stars": 3, "price_per_night": 8, "lat": 41.3986, "lng": 2.1643},
+                    {"name": "아이레 호텔 로셀론", "type": "호텔", "stars": 4, "price_per_night": 28, "lat": 41.4056, "lng": 2.1736}
+                ]
+            },
+            "파리": {
+                "lat": 48.8566, "lng": 2.3522,
+                "spots": [
+                    {"name": "에펠탑", "category": "관광명소", "lat": 48.8584, "lng": 2.2945, "rating": 4.9},
+                    {"name": "루브르 박물관", "category": "관광명소", "lat": 48.8606, "lng": 2.3376, "rating": 4.8},
+                    {"name": "몽마르뜨 언덕", "category": "휴양/힐링", "lat": 48.8867, "lng": 2.3431, "rating": 4.7},
+                    {"name": "오르세 미술관", "category": "관광명소", "lat": 48.8600, "lng": 2.3266, "rating": 4.8},
+                    {"name": "개선문", "category": "관광명소", "lat": 48.8738, "lng": 2.2950, "rating": 4.7},
+                    {"name": "샹젤리제 거리", "category": "쇼핑", "lat": 48.8698, "lng": 2.3075, "rating": 4.6},
+                    {"name": "노트르담 대성당", "category": "관광명소", "lat": 48.8530, "lng": 2.3499, "rating": 4.8},
+                    {"name": "뤽상부르 공원", "category": "휴양/힐링", "lat": 48.8462, "lng": 2.3372, "rating": 4.7},
+                    {"name": "마레 지구", "category": "쇼핑", "lat": 48.8575, "lng": 2.3590, "rating": 4.6},
+                    {"name": "Le Relais de l'Entrecôte", "category": "맛집탐방", "lat": 48.8711, "lng": 2.3018, "rating": 4.5},
+                    {"name": "Angelina Paris", "category": "맛집탐방", "lat": 48.8650, "lng": 2.3286, "rating": 4.6}
+                ],
+                "accommodations": [
+                    {"name": "리츠 파리", "type": "호텔", "stars": 5, "price_per_night": 150, "lat": 48.8681, "lng": 2.3289},
+                    {"name": "풀만 파리 투르 에펠", "type": "호텔", "stars": 4, "price_per_night": 45, "lat": 48.8556, "lng": 2.2916},
+                    {"name": "노보텔 파리 레 알", "type": "호텔", "stars": 4, "price_per_night": 35, "lat": 48.8606, "lng": 2.3463},
+                    {"name": "이비스 파리 에펠", "type": "호텔", "stars": 3, "price_per_night": 15, "lat": 48.8492, "lng": 2.3024}
+                ]
+            }
+        }
 
     def get_transport_options(self, dep: str, dest: str, transport_type: str, start_date: str) -> Dict:
-        """이동 수단별 데이터 생성 (Amadeus 연동)"""
-        
-        # 1. 항공이고 Amadeus 연동 가능하면 시도
         if transport_type == "항공":
             real_flight = self.flight_service.search_flights(dep, dest, start_date)
             if real_flight:
-                # 환율 대략 적용 (1 EUR/USD = 1300 KRW 가정하여 만원 단위로 변환)
                 real_flight['price'] = int(float(real_flight['price']) * 0.13) 
                 return real_flight
 
-            # Fallback to Mock
             airlines = ["대한항공", "아시아나", "제주항공", "진에어", "티웨이"]
             return {
                 "type": "항공",
                 "carrier": random.choice(airlines),
-                "price": random.randint(5, 15), # 편도 만원
-                "duration": random.randint(50, 80), # 분
+                "price": random.randint(5, 15),
+                "duration": random.randint(50, 80),
                 "detail": random.choice(["이코노미", "비즈니스"]),
                 "is_real": False
             }
@@ -260,7 +320,7 @@ class HybridDatabase:
                 "detail": "일반실",
                 "is_real": False
             }
-        else: # 렌트카, 버스 등
+        else:
             return {
                 "type": transport_type,
                 "carrier": "일반",
@@ -271,7 +331,11 @@ class HybridDatabase:
             }
 
     def get_accommodations(self, dest: str, min_rating: int) -> List[Dict]:
-        # 숙소 Mock 데이터
+        # 1. Check Mock DB first
+        if dest in self.mock_db and 'accommodations' in self.mock_db[dest]:
+            return self.mock_db[dest]['accommodations']
+            
+        # 2. Generic Fallback
         types = ["호텔", "리조트", "펜션", "게스트하우스", "한옥"]
         names = ["그랜드", "스테이", "오션뷰", "코지", "센트럴", "헤리티지"]
         return [{
@@ -281,19 +345,13 @@ class HybridDatabase:
             "stars": random.randint(min_rating, 5),
             "price_per_night": random.randint(5, 40),
             "amenities": random.sample(["수영장", "와이파이", "조식", "주차장", "BBQ"], k=3),
-            "barrier_free": random.choice([True, False]),
-            "kids_friendly": random.choice([True, False]),
             "lat": 33.5 + random.random()*0.1, 
             "lng": 126.5 + random.random()*0.1
-        } for _ in range(20)]
+        } for _ in range(10)]
 
     def get_spots(self, dest: str, styles: List[str]) -> List[Dict]:
-        """Google Places API 위주 검색 (실패 시 Context-Aware Mock)"""
         result = []
         target_styles = styles if styles else ["관광명소", "맛집"]
-        
-        # Google Places Service Init
-        google_service = GooglePlacesService(GOOGLE_MAPS_KEY)
         
         # 1. Try Google API
         api_success = False
@@ -302,51 +360,18 @@ class HybridDatabase:
             if style == "휴양/힐링": query = f"{dest} 공원/해변"
             elif style == "맛집탐방": query = f"{dest} 맛집"
             
-            places = google_service.search_places(query)
+            places = self.google_service.search_places(query)
             if places:
                 api_success = True
                 for p in places:
                     p['category'] = style
                     result.append(p)
         
-        # 2. Fallback: Predefined Mock Data for Major Cities
+        # 2. Fallback: Predefined Mock Data
         if not result:
-            # 주요 도시 하드코딩 데이터 (API 실패 시 사용)
-            mock_db = {
-                "바르셀로나": {
-                    "lat": 41.3851, "lng": 2.1734,
-                    "spots": [
-                        {"name": "사그라다 파밀리아", "category": "관광명소", "lat": 41.4036, "lng": 2.1744, "rating": 4.8},
-                        {"name": "구엘 공원", "category": "휴양/힐링", "lat": 41.4145, "lng": 2.1527, "rating": 4.6},
-                        {"name": "카사 바트요", "category": "관광명소", "lat": 41.3916, "lng": 2.1649, "rating": 4.7},
-                        {"name": "보케리아 시장", "category": "맛집탐방", "lat": 41.3817, "lng": 2.1715, "rating": 4.5},
-                        {"name": "바르셀로네타 해변", "category": "휴양/힐링", "lat": 41.3784, "lng": 2.1925, "rating": 4.4},
-                        {"name": "고딕 지구", "category": "관광명소", "lat": 41.3825, "lng": 2.1760, "rating": 4.6}
-                    ]
-                },
-                "파리": {
-                    "lat": 48.8566, "lng": 2.3522,
-                    "spots": [
-                        {"name": "에펠탑", "category": "관광명소", "lat": 48.8584, "lng": 2.2945, "rating": 4.8},
-                        {"name": "루브르 박물관", "category": "관광명소", "lat": 48.8606, "lng": 2.3376, "rating": 4.7},
-                        {"name": "몽마르뜨 언덕", "category": "휴양/힐링", "lat": 48.8867, "lng": 2.3431, "rating": 4.6}
-                    ]
-                },
-                "런던": {
-                    "lat": 51.5074, "lng": -0.1278,
-                    "spots": [
-                        {"name": "타워 브리지", "category": "관광명소", "lat": 51.5055, "lng": -0.0754, "rating": 4.7},
-                        {"name": "버킹엄 궁전", "category": "관광명소", "lat": 51.5014, "lng": -0.1419, "rating": 4.6},
-                        {"name": "하이드 파크", "category": "휴양/힐링", "lat": 51.5073, "lng": -0.1657, "rating": 4.5}
-                    ]
-                }
-            }
-            
-            city_data = mock_db.get(dest)
+            city_data = self.mock_db.get(dest)
             if city_data:
-                # 도시 데이터가 있으면 사용
                 for spot in city_data['spots']:
-                    # 사용자가 선택한 스타일에 맞는 것만 필터링하거나, 없으면 다 넣음
                     if any(s in spot['category'] for s in target_styles) or len(target_styles) == 0:
                         result.append({
                             "name": spot['name'],
@@ -358,9 +383,8 @@ class HybridDatabase:
                             "rating": spot['rating']
                         })
             else:
-                # 도시 데이터도 없으면 일반 Mock (좌표는 서울/제주 랜덤 방지 위해 0,0 근처나 기본값)
-                # 좌표가 엉뚱하면 지도가 이상하므로, 기본 좌표를 설정해주는 것이 좋음
-                base_lat, base_lng = 37.5665, 126.9780 # 서울
+                # Generic Mock
+                base_lat, base_lng = 37.5665, 126.9780
                 if dest == "제주": base_lat, base_lng = 33.4996, 126.5312
                 elif dest == "부산": base_lat, base_lng = 35.1796, 129.0756
                 
@@ -388,19 +412,14 @@ class TravelEngine:
 
     def _calculate_match_rate(self, data: Dict, plan: Dict) -> int:
         score = 100
-        
-        # 1. 예산 페널티
         user_budget = data.get("price_per_night_manwon", 20)
         plan_price = plan['accommodation']['price_per_night']
         if plan_price > user_budget: 
             score -= min(20, (plan_price - user_budget))
             
-        # 2. 스타일 보너스
         user_styles = set(data.get("style", []))
         if plan.get("theme_tag") in user_styles: score += 5
         
-        # 3. [NEW] 중요도 가중치 반영
-        # 중요도(0~5)에 따라 관련 항목 매칭 시 가산점
         imp_food = data.get("importance_food", 3)
         imp_sight = data.get("importance_sightseeing", 3)
         
@@ -416,11 +435,9 @@ class TravelEngine:
         styles = data.get("style", [])
         people = data.get("people", 2)
         
-        # [NEW] 일정 밀도 반영
         density = data.get("schedule_density", "보통")
         spots_per_day = 2 if density == "여유" else (4 if density == "빡빡" else 3)
         
-        # 날짜 계산
         try:
             d_s = dt.datetime.strptime(data["start_date"], "%Y-%m-%d")
             d_e = dt.datetime.strptime(data["end_date"], "%Y-%m-%d")
@@ -429,21 +446,22 @@ class TravelEngine:
         except: duration = 3
 
         candidates = []
-        concepts = ["가성비 최적화", "밸런스 추천", "럭셔리/프리미엄", "현지 감성"]
+        concepts = ["가성비 최적화", "밸런스 추천", "럭셔리/프리미엄"]
         
         user_transports = data.get("transport", ["항공"])
         if not user_transports: user_transports = ["항공"]
 
         accommodations = self.db.get_accommodations(dest, data.get("star_rating", 3))
+        # Shuffle accommodations to ensure variety
+        random.shuffle(accommodations)
         
-        for i in range(3): # 3개 옵션 생성
+        for i in range(3):
             selected_transport = random.choice(user_transports)
-            
             transport_data = self.db.get_transport_options(dep, dest, selected_transport, data["start_date"])
             
-            lodge = random.choice(accommodations)
+            # Ensure unique accommodation for each plan if possible
+            lodge = accommodations[i % len(accommodations)]
             
-            # 스팟 검색 및 셔플
             all_spots = self.db.get_spots(dest, styles)
             random.shuffle(all_spots)
             
@@ -451,7 +469,6 @@ class TravelEngine:
             spot_idx = 0
             for d in range(duration):
                 day_spots = []
-                # 밀도에 따른 스팟 수 조정
                 k = min(len(all_spots) - spot_idx, spots_per_day)
                 for _ in range(k): 
                     if spot_idx < len(all_spots):
@@ -481,15 +498,13 @@ class TravelEngine:
 # [HELPER] Data Adapter (Engine -> View)
 # ==============================================================================
 def convert_to_view_model(candidates, start_date_str):
-    """TravelEngine의 출력을 app_3.py의 시각화 포맷으로 변환"""
     view_plans = []
-    start_date = dt.datetime.strptime(start_date_str, "%Y-%m-%d").date()
     
     for cand in candidates:
         days = []
         for d_idx, day_spots in enumerate(cand['schedule']):
             places = []
-            # 1. 숙소 (아침)
+            # 1. Accommodation (Morning)
             places.append({
                 "time": "09:00",
                 "name": f"{cand['accommodation']['name']} (출발)",
@@ -497,11 +512,11 @@ def convert_to_view_model(candidates, start_date_str):
                 "type": "숙소",
                 "lat": cand['accommodation']['lat'],
                 "lng": cand['accommodation']['lng'],
-                "rating": cand['accommodation']['stars'],
+                "rating": cand['accommodation'].get('stars', 3),
                 "img": "https://source.unsplash.com/400x300/?hotel"
             })
             
-            # 2. 스팟들
+            # 2. Spots
             base_time = 10
             for spot in day_spots:
                 places.append({
@@ -511,7 +526,7 @@ def convert_to_view_model(candidates, start_date_str):
                     "type": spot['category'],
                     "lat": spot['lat'],
                     "lng": spot['lng'],
-                    "rating": 4.5,
+                    "rating": spot.get('rating', 4.5),
                     "img": spot['image'] or f"https://source.unsplash.com/400x300/?{spot['category']}",
                     "url": spot['url']
                 })
@@ -525,93 +540,48 @@ def convert_to_view_model(candidates, start_date_str):
             "tags": [cand['theme_tag'], cand['flight']['carrier'], cand['accommodation']['type']],
             "days": days,
             "total_price": cand['total_price'],
-            "raw_candidate": cand # 원본 데이터 보존
+            "raw_candidate": cand
         })
     return view_plans
 
 # ==============================================================================
-# [HELPER] Map Renderer
+# [HELPER] Map Renderer (FOLIUM)
 # ==============================================================================
-def render_kakao_map_html(markers, path_coords):
-    if not markers: return "<div>지도 데이터가 없습니다.</div>"
+def render_folium_map(markers, path_coords):
+    if not markers:
+        return None
     
-    # [FIX] Ensure lat/lng are floats
-    try:
-        avg_lat = sum([float(m['lat']) for m in markers]) / len(markers)
-        avg_lon = sum([float(m['lng']) for m in markers]) / len(markers)
-    except:
-        return "<div>좌표 데이터 오류</div>"
+    # Calculate Center
+    avg_lat = sum([m['lat'] for m in markers]) / len(markers)
+    avg_lon = sum([m['lng'] for m in markers]) / len(markers)
+    
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=13)
+    
+    # Draw Path
+    if len(path_coords) > 1:
+        points = [(p['lat'], p['lng']) for p in path_coords]
+        folium.PolyLine(points, color="blue", weight=2.5, opacity=1).add_to(m)
+    
+    # Draw Markers
+    for marker in markers:
+        icon_color = "red" if marker.get('type') == "숙소" else "blue"
+        icon = folium.Icon(color=icon_color, icon="info-sign")
         
-    markers_json = json.dumps(markers)
-    path_json = json.dumps(path_coords)
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <style>
-            html, body {{ margin: 0; padding: 0; height: 100%; }}
-            #map {{ width: 100%; height: 500px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); border: 1px solid #ddd; }}
-            .wrap {{ position: absolute; left: 0; bottom: 40px; width: 288px; height: 132px; margin-left: -144px; text-align: left; overflow: hidden; font-size: 12px; font-family: 'Pretendard', sans-serif; line-height: 1.5; }}
-            .wrap * {{ padding: 0; margin: 0; }}
-            .wrap .info {{ width: 286px; height: 120px; border-radius: 5px; border-bottom: 2px solid #ccc; border-right: 1px solid #ccc; overflow: hidden; background: #fff; box-shadow: 0 1px 2px #888; }}
-            .info .title {{ padding: 5px 0 0 10px; height: 30px; background: #eee; border-bottom: 1px solid #ddd; font-size: 14px; font-weight: bold; color: #333; display: flex; justify-content: space-between; align-items: center; }}
-            .info .body {{ position: relative; overflow: hidden; display: flex; padding: 10px; }}
-            .info .img {{ width: 73px; height: 70px; border: 1px solid #ddd; color: #888; overflow: hidden; margin-right: 10px; }}
-            .info .img img {{ width: 100%; height: 100%; object-fit: cover; }}
-            .info .desc {{ flex: 1; }}
-            .desc .ellipsis {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #333; font-size: 13px; font-weight: 600; }}
-            .desc .rating {{ color: #1a73e8; font-weight: 700; margin-top: 4px; }}
-        </style>
-    </head>
-    <body>
-        <div id="map"></div>
-        <script type="text/javascript" src="https://dapi.kakao.com/v2/maps/sdk.js?appkey={KAKAO_JS_KEY}&libraries=services"></script>
-        <script>
-            var container = document.getElementById('map');
-            var options = {{ center: new kakao.maps.LatLng({avg_lat}, {avg_lon}), level: 9 }};
-            var map = new kakao.maps.Map(container, options);
-            var markersData = {markers_json};
-            var pathData = {path_json};
-
-            var linePath = [];
-            pathData.forEach(function(p) {{ linePath.push(new kakao.maps.LatLng(p.lat, p.lng)); }});
-            var polyline = new kakao.maps.Polyline({{ path: linePath, strokeWeight: 5, strokeColor: '#1A73E8', strokeOpacity: 0.8, strokeStyle: 'solid' }});
-            polyline.setMap(map);
-
-            var overlays = [];
-            markersData.forEach(function(m, index) {{
-                var position = new kakao.maps.LatLng(m.lat, m.lng);
-                var marker = new kakao.maps.Marker({{ map: map, position: position }});
-                
-                var content = `
-                    <div class="wrap">
-                        <div class="info">
-                            <div class="title">${{(index+1) + '. ' + m.title}}</div>
-                            <div class="body">
-                                <div class="img"><img src="${{m.img}}" width="73" height="70"></div>
-                                <div class="desc">
-                                    <div class="rating">⭐ ${{m.rating}}</div>
-                                    <div class="jibun">${{m.desc.substring(0, 30) + '...'}}</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>`;
-                var overlay = new kakao.maps.CustomOverlay({{ content: content, map: null, position: marker.getPosition() }});
-                overlays.push(overlay);
-
-                kakao.maps.event.addListener(marker, 'click', function() {{
-                    overlays.forEach(o => o.setMap(null));
-                    overlay.setMap(map);
-                }});
-                kakao.maps.event.addListener(map, 'click', function() {{ overlay.setMap(null); }});
-            }});
-        </script>
-    </body>
-    </html>
-    """
-    return html
+        popup_html = f"""
+        <div style="width:200px">
+            <b>{marker['title']}</b><br>
+            <img src="{marker['img']}" width="100%"><br>
+            {marker['desc']}
+        </div>
+        """
+        folium.Marker(
+            [marker['lat'], marker['lng']],
+            popup=folium.Popup(popup_html, max_width=250),
+            tooltip=marker['title'],
+            icon=icon
+        ).add_to(m)
+        
+    return m
 
 # ==============================================================================
 # [MAIN] Application Flow
@@ -622,7 +592,7 @@ if "step" not in st.session_state: st.session_state["step"] = 1
 if "form_data" not in st.session_state: st.session_state["form_data"] = {}
 if "view_plans" not in st.session_state: st.session_state["view_plans"] = []
 
-# --- STEP 1: INPUT FORM (Full Version from app_1.py) ---
+# --- STEP 1: INPUT FORM ---
 if st.session_state["step"] == 1:
     st.markdown("""
     <div class="main-header">
@@ -636,7 +606,7 @@ if st.session_state["step"] == 1:
         # Section 1: Basic Info
         st.markdown('<div class="section-box"><div class="section-title">1. 기본 정보</div>', unsafe_allow_html=True)
         c1, c2 = st.columns([3, 2])
-        dest_city = c1.text_input("여행지 (도시)", placeholder="예: 제주, 부산, 도쿄")
+        dest_city = c1.text_input("여행지 (도시)", placeholder="예: 바르셀로나, 파리, 도쿄")
         dep_city = c2.text_input("출발지", value="서울")
         
         c3, c4 = st.columns([2, 3])
@@ -699,7 +669,6 @@ if st.session_state["step"] == 1:
             if not dest_city:
                 st.error("여행지를 입력해주세요!")
             else:
-                # Save to session
                 st.session_state["form_data"] = {
                     "dest_city": dest_city,
                     "dep_city": dep_city,
@@ -718,7 +687,6 @@ if st.session_state["step"] == 1:
                     "food_prefs": food_prefs,
                     "walk_tolerance": walk_tolerance,
                     "wishlist": wishlist,
-                    # Derived for engine
                     "star_rating": 3 if "2~3" in stay_grade else (4 if "3~4" in stay_grade else 5),
                     "price_per_night_manwon": 5 if "5만원" in stay_grade else (10 if "10만원" in stay_grade else (20 if "20만원" in stay_grade else 50))
                 }
@@ -736,7 +704,6 @@ elif st.session_state["step"] == 2:
         candidates, p_time = engine.process(st.session_state["form_data"])
         
         st.write("✨ 코스 최적화 중...")
-        # Convert to View Model
         view_plans = convert_to_view_model(candidates, st.session_state["form_data"]["start_date"])
         st.session_state["view_plans"] = view_plans
         
@@ -780,24 +747,28 @@ elif st.session_state["step"] == 3:
             </div>
             """, unsafe_allow_html=True)
 
-            # Map
+            # Map Data Prep
             map_markers = []
             map_path = []
             for day in plan['days']:
                 for place in day['places']:
-                    # [FIX] Ensure lat/lng are present
                     if place.get('lat') and place.get('lng'):
                         map_markers.append({
                             "lat": place['lat'], "lng": place['lng'],
                             "title": place['name'],
                             "img": place['img'],
                             "rating": place['rating'],
-                            "desc": place['desc']
+                            "desc": place['desc'],
+                            "type": place['type']
                         })
                         map_path.append({"lat": place['lat'], "lng": place['lng']})
             
-            # [FIX] Height increased to 500px
-            components.html(render_kakao_map_html(map_markers, map_path), height=500)
+            # [FIX] Render Folium Map
+            m = render_folium_map(map_markers, map_path)
+            if m:
+                st_folium(m, width="100%", height=500)
+            else:
+                st.warning("지도 데이터를 불러올 수 없습니다.")
             
             st.divider()
 
