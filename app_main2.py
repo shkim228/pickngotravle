@@ -236,10 +236,158 @@ class GooglePlacesService:
             })
         return places
 
+# [NEW] Kakao Local Service (Korea Place Search)
+class KakaoLocalService:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+    
+    def search_places(self, city: str, category: str) -> List[Dict]:
+        if not self.api_key: return []
+        
+        try:
+            query = f"{city} {category}"
+            headers = {"Authorization": f"KakaoAK {self.api_key}"}
+            params = {"query": query, "size": 5}
+            
+            res = requests.get(self.base_url, headers=headers, params=params)
+            if res.status_code == 200:
+                results = res.json().get('documents', [])
+                places = []
+                for p in results:
+                    places.append({
+                        "name": p['place_name'],
+                        "category": category,
+                        "source": "Kakao",
+                        "url": p.get('place_url', '#'),
+                        "image": f"https://source.unsplash.com/400x300/?{city},{p['place_name']}",
+                        "lat": float(p['y']),
+                        "lng": float(p['x']),
+                        "rating": 4.5,
+                        "address": p.get('address_name', '')
+                    })
+                return places
+        except Exception as e:
+            print(f"Kakao Local Error: {e}")
+        return []
+
+# [NEW] TourAPI Service (Korea Descriptions)
+class TourAPIService:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "http://apis.data.go.kr/B551011/KorService1"
+    
+    def get_area_based_list(self, city: str) -> List[Dict]:
+        """지역 기반 관광정보 조회"""
+        if not self.api_key: return []
+        
+        try:
+            # 시/도 코드 매핑 (간단 버전)
+            area_codes = {
+                "서울": "1", "인천": "2", "대전": "3", "대구": "4", "광주": "5",
+                "부산": "6", "울산": "7", "세종": "8", "경기": "31", "강원": "32",
+                "충북": "33", "충남": "34", "경북": "35", "경남": "36", "전북": "37",
+                "전남": "38", "제주": "39"
+            }
+            
+            area_code = area_codes.get(city, "39")  # 기본값 제주
+            
+            params = {
+                "serviceKey": self.api_key,
+                "numOfRows": "10",
+                "pageNo": "1",
+                "MobileOS": "ETC",
+                "MobileApp": "PickNGo",
+                "areaCode": area_code,
+                "_type": "json"
+            }
+            
+            res = requests.get(f"{self.base_url}/areaBasedList1", params=params)
+            if res.status_code == 200:
+                data = res.json()
+                items = data.get('response', {}).get('body', {}).get('items', {}).get('item', [])
+                if isinstance(items, dict): items = [items]
+                
+                results = []
+                for item in items[:5]:
+                    results.append({
+                        "name": item.get('title', ''),
+                        "desc": item.get('overview', '관광지 설명'),
+                        "image": item.get('firstimage', ''),
+                        "addr": item.get('addr1', ''),
+                        "lat": float(item.get('mapy', 33.5)) if item.get('mapy') else 33.5,
+                        "lng": float(item.get('mapx', 126.5)) if item.get('mapx') else 126.5
+                    })
+                return results
+        except Exception as e:
+            print(f"TourAPI Error: {e}")
+        return []
+
+# [NEW] Wikipedia Service (Global Descriptions)
+class WikipediaService:
+    def __init__(self):
+        self.base_url = "https://ko.wikipedia.org/w/api.php"
+    
+    def search_by_coords(self, lat: float, lng: float) -> str:
+        """좌표 기반 위키백과 검색"""
+        try:
+            # 1. GeoSearch로 근처 문서 찾기
+            params = {
+                "action": "query",
+                "list": "geosearch",
+                "gscoord": f"{lat}|{lng}",
+                "gsradius": "1000",  # 1km 반경
+                "gslimit": "1",
+                "format": "json"
+            }
+            
+            res = requests.get(self.base_url, params=params)
+            if res.status_code == 200:
+                data = res.json()
+                pages = data.get('query', {}).get('geosearch', [])
+                if pages:
+                    page_id = pages[0]['pageid']
+                    
+                    # 2. 해당 문서의 요약 가져오기
+                    extract_params = {
+                        "action": "query",
+                        "prop": "extracts",
+                        "exintro": True,
+                        "explaintext": True,
+                        "pageids": page_id,
+                        "format": "json"
+                    }
+                    
+                    extract_res = requests.get(self.base_url, params=extract_params)
+                    if extract_res.status_code == 200:
+                        extract_data = extract_res.json()
+                        page_data = extract_data.get('query', {}).get('pages', {}).get(str(page_id), {})
+                        extract = page_data.get('extract', '')
+                        # 첫 2문장만 추출
+                        sentences = extract.split('. ')[:2]
+                        return '. '.join(sentences) + '.' if sentences else '역사적인 명소입니다.'
+        except Exception as e:
+            print(f"Wikipedia Error: {e}")
+        return "유명한 관광 명소입니다."
+
+# [HELPER] Korea City Detection
+def is_korea_city(city: str) -> bool:
+    """한국 도시 여부 판별"""
+    korea_cities = [
+        "서울", "부산", "인천", "대구", "대전", "광주", "울산", "세종",
+        "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
+        "수원", "성남", "고양", "용인", "청주", "천안", "전주", "포항", "창원",
+        "제주도", "강릉", "속초", "경주", "여수", "통영", "거제"
+    ]
+    return any(k in city for k in korea_cities)
+
 class HybridDatabase:
     def __init__(self):
         self.flight_service = FlightService()
         self.google_service = GooglePlacesService(GOOGLE_MAPS_KEY)
+        self.kakao_service = KakaoLocalService(KAKAO_REST_KEY)
+        self.tour_service = TourAPIService(TOUR_API_KEY)
+        self.wiki_service = WikipediaService()
         
         # [NEW] Expanded Mock DB for Major Cities
         self.mock_db = {
@@ -350,24 +498,57 @@ class HybridDatabase:
         } for _ in range(10)]
 
     def get_spots(self, dest: str, styles: List[str]) -> List[Dict]:
+        """Hybrid Spot Search: Korea (Kakao+TourAPI) vs Global (Google+Wikipedia)"""
         result = []
         target_styles = styles if styles else ["관광명소", "맛집"]
         
-        # 1. Try Google API
-        api_success = False
-        for style in target_styles:
-            query = f"{dest} {style}"
-            if style == "휴양/힐링": query = f"{dest} 공원/해변"
-            elif style == "맛집탐방": query = f"{dest} 맛집"
+        # [HYBRID LOGIC] Korea vs Global
+        if is_korea_city(dest):
+            # === KOREA PATH: Kakao + TourAPI ===
+            print(f"[Korea Mode] Using Kakao + TourAPI for {dest}")
             
-            places = self.google_service.search_places(query)
-            if places:
-                api_success = True
-                for p in places:
-                    p['category'] = style
-                    result.append(p)
+            # 1. Try Kakao Local Search
+            for style in target_styles:
+                kakao_places = self.kakao_service.search_places(dest, style)
+                if kakao_places:
+                    result.extend(kakao_places)
+            
+            # 2. If Kakao fails, try TourAPI
+            if not result:
+                tour_places = self.tour_service.get_area_based_list(dest)
+                if tour_places:
+                    for tp in tour_places:
+                        result.append({
+                            "name": tp['name'],
+                            "category": "관광명소",
+                            "source": "TourAPI",
+                            "url": "#",
+                            "image": tp.get('image') or f"https://source.unsplash.com/400x300/?{dest},{tp['name']}",
+                            "lat": tp['lat'],
+                            "lng": tp['lng'],
+                            "rating": 4.5,
+                            "desc": tp.get('desc', '관광지 설명')
+                        })
+        else:
+            # === GLOBAL PATH: Google + Wikipedia ===
+            print(f"[Global Mode] Using Google + Wikipedia for {dest}")
+            
+            # 1. Try Google Places API
+            for style in target_styles:
+                query = f"{dest} {style}"
+                if style == "휴양/힐링": query = f"{dest} 공원/해변"
+                elif style == "맛집탐방": query = f"{dest} 맛집"
+                
+                google_places = self.google_service.search_places(query)
+                if google_places:
+                    for gp in google_places:
+                        gp['category'] = style
+                        # 2. Enrich with Wikipedia
+                        wiki_desc = self.wiki_service.search_by_coords(gp['lat'], gp['lng'])
+                        gp['desc'] = wiki_desc
+                        result.append(gp)
         
-        # 2. Fallback: Predefined Mock Data
+        # [FALLBACK] If all APIs fail, use Mock DB
         if not result:
             city_data = self.mock_db.get(dest)
             if city_data:
@@ -380,7 +561,8 @@ class HybridDatabase:
                             "url": f"https://www.google.com/maps/search/?api=1&query={spot['lat']},{spot['lng']}",
                             "image": f"https://source.unsplash.com/400x300/?{dest},{spot['name']}",
                             "lat": spot['lat'], "lng": spot['lng'],
-                            "rating": spot['rating']
+                            "rating": spot['rating'],
+                            "desc": f"{spot['name']}는 {dest}의 대표적인 {spot['category']} 명소입니다."
                         })
             else:
                 # Generic Mock
@@ -398,11 +580,22 @@ class HybridDatabase:
                         "image": f"https://source.unsplash.com/400x300/?{dest},travel",
                         "lat": base_lat + (random.random()-0.5)*0.05,
                         "lng": base_lng + (random.random()-0.5)*0.05,
-                        "rating": 4.0
+                        "rating": 4.0,
+                        "desc": f"{name}에서 {dest}의 매력을 느껴보세요."
                     })
 
         if not result:
-             result.append({"name": f"{dest} 투어 센터", "category": "기본", "source":"System", "url": "#", "image":None, "lat":37.5665, "lng":126.9780, "rating": 4.5})
+             result.append({
+                 "name": f"{dest} 투어 센터", 
+                 "category": "기본", 
+                 "source":"System", 
+                 "url": "#", 
+                 "image":None, 
+                 "lat":37.5665, 
+                 "lng":126.9780, 
+                 "rating": 4.5,
+                 "desc": f"{dest} 여행의 시작점입니다."
+             })
         
         return result
 
