@@ -107,9 +107,11 @@ def get_iata_code(city_name: str) -> str:
     mapping = {
         "서울": "SEL", "인천": "ICN", "김포": "GMP",
         "제주": "CJU", "부산": "PUS",
-        "도쿄": "TYO", "오사카": "OSA", "후쿠오카": "FUK",
-        "방콕": "BKK", "다낭": "DAD", "싱가포르": "SIN",
-        "파리": "PAR", "런던": "LON", "뉴욕": "NYC"
+        "도쿄": "TYO", "오사카": "OSA", "후쿠오카": "FUK", "삿포로": "CTS", "오키나와": "OKA",
+        "방콕": "BKK", "다낭": "DAD", "싱가포르": "SIN", "발리": "DPS",
+        "파리": "PAR", "런던": "LON", "로마": "ROM", "바르셀로나": "BCN", "마드리드": "MAD",
+        "뉴욕": "NYC", "LA": "LAX", "샌프란시스코": "SFO", "하와이": "HNL",
+        "시드니": "SYD", "멜버른": "MEL"
     }
     return mapping.get(city_name, "ICN") # 기본값 인천
 
@@ -165,6 +167,63 @@ class FlightService:
         except Exception as e:
             print(f"Flight Search Error: {e}")
             return None
+
+# [NEW] Google Places Service (v1 New API)
+class GooglePlacesService:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://places.googleapis.com/v1/places:searchText"
+
+    def search_places(self, query: str) -> List[Dict]:
+        if not self.api_key: return []
+        
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": self.api_key,
+                "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.photos,places.location,places.id"
+            }
+            payload = {"textQuery": query, "languageCode": "ko"}
+            
+            res = requests.post(self.base_url, json=payload, headers=headers)
+            
+            if res.status_code == 200:
+                results = res.json().get('places', [])
+                places = []
+                for p in results[:3]: # Top 3
+                    # Photo URL Construction
+                    img_url = None
+                    if p.get('photos'):
+                        photo_name = p['photos'][0]['name'] # places/PLACE_ID/photos/PHOTO_ID
+                        # Skip photo API call to save quota/complexity, use placeholder or construct if simple
+                        # v1 photo API is complex (media/name), let's use Unsplash fallback for now or try to construct
+                        # img_url = f"https://places.googleapis.com/v1/{photo_name}/media?key={self.api_key}&maxHeightPx=400&maxWidthPx=400"
+                        # Note: v1 media endpoint returns binary, not URL. Better to use Unsplash for display speed.
+                        pass
+                    
+                    # Fallback Image
+                    if not img_url:
+                         img_url = f"https://source.unsplash.com/400x300/?{query.split()[-1]},{p['displayName']['text']}"
+
+                    lat = p.get('location', {}).get('latitude', 33.5)
+                    lng = p.get('location', {}).get('longitude', 126.5)
+
+                    places.append({
+                        "name": p['displayName']['text'],
+                        "category": "관광/맛집",
+                        "source": "Google",
+                        "url": f"https://www.google.com/maps/search/?api=1&query={lat},{lng}&query_place_id={p.get('id')}",
+                        "image": img_url,
+                        "lat": lat,
+                        "lng": lng,
+                        "rating": p.get('rating', 4.5)
+                    })
+                return places
+            else:
+                print(f"Google API Status: {res.status_code} {res.text}")
+        except Exception as e:
+            print(f"Google Places Error: {e}")
+        return []
 
 class HybridDatabase:
     def __init__(self):
@@ -229,59 +288,98 @@ class HybridDatabase:
         } for _ in range(20)]
 
     def get_spots(self, dest: str, styles: List[str]) -> List[Dict]:
-        """Kakao(맛집/쇼핑) + TourAPI(관광/자연) 하이브리드 검색"""
+        """Google Places API 위주 검색 (실패 시 Context-Aware Mock)"""
         result = []
         target_styles = styles if styles else ["관광명소", "맛집"]
         
-        kakao_header = {"Authorization": f"KakaoAK {KAKAO_REST_KEY}"}
-        kakao_url = "https://dapi.kakao.com/v2/local/search/keyword.json"
-        tour_url = "http://apis.data.go.kr/B551011/KorService1/searchKeyword1"
+        # Google Places Service Init
+        google_service = GooglePlacesService(GOOGLE_MAPS_KEY)
         
+        # 1. Try Google API
+        api_success = False
         for style in target_styles:
-            # 1. Kakao API: 맛집, 쇼핑, 카페
-            if style in ["맛집", "쇼핑", "카페", "식도락"]:
-                try:
-                    res = requests.get(kakao_url, headers=kakao_header, params={"query": f"{dest} {style}", "size": 3})
-                    if res.status_code == 200:
-                        for p in res.json().get('documents', []):
-                            result.append({
-                                "name": p['place_name'],
-                                "category": style,
-                                "source": "Kakao",
-                                "url": p['place_url'],
-                                "image": None,
-                                "lat": float(p['y']), "lng": float(p['x'])
-                            })
-                except: pass
+            query = f"{dest} {style}"
+            if style == "휴양/힐링": query = f"{dest} 공원/해변"
+            elif style == "맛집탐방": query = f"{dest} 맛집"
             
-            # 2. TourAPI: 관광, 자연, 역사, 문화 등
-            else:
-                keyword = f"{dest} {style}"
-                if style == "휴양": keyword = f"{dest} 힐링"
-                
-                params = {
-                    "serviceKey": TOUR_API_KEY, "numOfRows": "3", "pageNo": "1",
-                    "MobileOS": "ETC", "MobileApp": "PickNGo", "_type": "json",
-                    "listYN": "Y", "arrange": "O", "keyword": keyword
-                }
-                try:
-                    res = requests.get(tour_url, params=params)
-                    if res.status_code == 200:
-                        items = res.json()['response']['body']['items']['item']
-                        for item in items:
-                            if item.get('mapx') and item.get('mapy'):
-                                result.append({
-                                    "name": item.get('title'),
-                                    "category": style,
-                                    "source": "TourAPI",
-                                    "url": f"https://map.kakao.com/link/search/{item.get('title')}",
-                                    "image": item.get('firstimage'),
-                                    "lat": float(item.get('mapy')), "lng": float(item.get('mapx'))
-                                })
-                except: pass
+            places = google_service.search_places(query)
+            if places:
+                api_success = True
+                for p in places:
+                    p['category'] = style
+                    result.append(p)
         
-        if not result: # 데이터 없을 경우 대비
-            result.append({"name": f"{dest} 투어 센터", "category": "기본", "source":"System", "url": "#", "image":None, "lat":33.5, "lng":126.5})
+        # 2. Fallback: Predefined Mock Data for Major Cities
+        if not result:
+            # 주요 도시 하드코딩 데이터 (API 실패 시 사용)
+            mock_db = {
+                "바르셀로나": {
+                    "lat": 41.3851, "lng": 2.1734,
+                    "spots": [
+                        {"name": "사그라다 파밀리아", "category": "관광명소", "lat": 41.4036, "lng": 2.1744, "rating": 4.8},
+                        {"name": "구엘 공원", "category": "휴양/힐링", "lat": 41.4145, "lng": 2.1527, "rating": 4.6},
+                        {"name": "카사 바트요", "category": "관광명소", "lat": 41.3916, "lng": 2.1649, "rating": 4.7},
+                        {"name": "보케리아 시장", "category": "맛집탐방", "lat": 41.3817, "lng": 2.1715, "rating": 4.5},
+                        {"name": "바르셀로네타 해변", "category": "휴양/힐링", "lat": 41.3784, "lng": 2.1925, "rating": 4.4},
+                        {"name": "고딕 지구", "category": "관광명소", "lat": 41.3825, "lng": 2.1760, "rating": 4.6}
+                    ]
+                },
+                "파리": {
+                    "lat": 48.8566, "lng": 2.3522,
+                    "spots": [
+                        {"name": "에펠탑", "category": "관광명소", "lat": 48.8584, "lng": 2.2945, "rating": 4.8},
+                        {"name": "루브르 박물관", "category": "관광명소", "lat": 48.8606, "lng": 2.3376, "rating": 4.7},
+                        {"name": "몽마르뜨 언덕", "category": "휴양/힐링", "lat": 48.8867, "lng": 2.3431, "rating": 4.6}
+                    ]
+                },
+                "런던": {
+                    "lat": 51.5074, "lng": -0.1278,
+                    "spots": [
+                        {"name": "타워 브리지", "category": "관광명소", "lat": 51.5055, "lng": -0.0754, "rating": 4.7},
+                        {"name": "버킹엄 궁전", "category": "관광명소", "lat": 51.5014, "lng": -0.1419, "rating": 4.6},
+                        {"name": "하이드 파크", "category": "휴양/힐링", "lat": 51.5073, "lng": -0.1657, "rating": 4.5}
+                    ]
+                }
+            }
+            
+            city_data = mock_db.get(dest)
+            if city_data:
+                # 도시 데이터가 있으면 사용
+                for spot in city_data['spots']:
+                    # 사용자가 선택한 스타일에 맞는 것만 필터링하거나, 없으면 다 넣음
+                    if any(s in spot['category'] for s in target_styles) or len(target_styles) == 0:
+                        result.append({
+                            "name": spot['name'],
+                            "category": spot['category'],
+                            "source": "Mock(Predefined)",
+                            "url": f"https://www.google.com/maps/search/?api=1&query={spot['lat']},{spot['lng']}",
+                            "image": f"https://source.unsplash.com/400x300/?{dest},{spot['name']}",
+                            "lat": spot['lat'], "lng": spot['lng'],
+                            "rating": spot['rating']
+                        })
+            else:
+                # 도시 데이터도 없으면 일반 Mock (좌표는 서울/제주 랜덤 방지 위해 0,0 근처나 기본값)
+                # 좌표가 엉뚱하면 지도가 이상하므로, 기본 좌표를 설정해주는 것이 좋음
+                base_lat, base_lng = 37.5665, 126.9780 # 서울
+                if dest == "제주": base_lat, base_lng = 33.4996, 126.5312
+                elif dest == "부산": base_lat, base_lng = 35.1796, 129.0756
+                
+                mock_names = [f"{dest} 대표 명소", f"{dest} 시내 중심가", f"{dest} 맛집 거리"]
+                for i, name in enumerate(mock_names):
+                    result.append({
+                        "name": name,
+                        "category": "기본",
+                        "source": "Mock(Generic)",
+                        "url": "#",
+                        "image": f"https://source.unsplash.com/400x300/?{dest},travel",
+                        "lat": base_lat + (random.random()-0.5)*0.05,
+                        "lng": base_lng + (random.random()-0.5)*0.05,
+                        "rating": 4.0
+                    })
+
+        if not result:
+             result.append({"name": f"{dest} 투어 센터", "category": "기본", "source":"System", "url": "#", "image":None, "lat":37.5665, "lng":126.9780, "rating": 4.5})
+        
         return result
 
 class TravelEngine:
@@ -454,7 +552,7 @@ def render_kakao_map_html(markers, path_coords):
         <meta charset="utf-8">
         <style>
             html, body {{ margin: 0; padding: 0; height: 100%; }}
-            #map {{ width: 100%; height: 100%; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); border: 1px solid #ddd; }}
+            #map {{ width: 100%; height: 500px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); border: 1px solid #ddd; }}
             .wrap {{ position: absolute; left: 0; bottom: 40px; width: 288px; height: 132px; margin-left: -144px; text-align: left; overflow: hidden; font-size: 12px; font-family: 'Pretendard', sans-serif; line-height: 1.5; }}
             .wrap * {{ padding: 0; margin: 0; }}
             .wrap .info {{ width: 286px; height: 120px; border-radius: 5px; border-bottom: 2px solid #ccc; border-right: 1px solid #ccc; overflow: hidden; background: #fff; box-shadow: 0 1px 2px #888; }}
