@@ -1,3 +1,5 @@
 streamlit>=1.38.0
 amadeus
+folium
+streamlit-folium
 requests
